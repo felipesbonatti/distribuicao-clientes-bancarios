@@ -1,0 +1,256 @@
+from pyspark.sql import SparkSession, DataFrame, functions as F 
+
+from pyspark.sql.window import Window 
+
+from pyspark import StorageLevel 
+
+from datetime import datetime 
+
+import logging 
+
+from typing import Tuple 
+
+from dataclasses import dataclass
+
+
+
+@dataclass
+
+class ConfigDistribuicao:
+
+    """Configurações do processo de distribuição"""
+
+    limite_clientes: int = 1473
+
+
+
+def setup_logging() -> logging.Logger:
+
+    """Configura o logger"""
+
+    logger = logging.getLogger("distribuicao")
+
+    if not logger.handlers:
+
+        handler = logging.StreamHandler()
+
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+        handler.setFormatter(formatter)
+
+        logger.addHandler(handler)
+
+        logger.setLevel(logging.INFO)
+
+    return logger
+
+
+
+def get_spark_session(config: ConfigDistribuicao) -> SparkSession:
+
+    """Inicializa a SparkSession"""
+
+    return (SparkSession.builder
+
+        .appName("DistribuicaoClientes")
+
+        .config("spark.sql.shuffle.partitions", "600")
+
+        .getOrCreate())
+
+
+
+def load_data(spark: SparkSession, logger: logging.Logger) -> Tuple[DataFrame, DataFrame]:
+
+    """Carrega dados de clientes e gerentes"""
+
+    logger.info("Carregando dados de clientes e gerentes...")
+
+   
+
+    # Carrega os dados
+
+    clientes_df = spark.table(""schema.tb_clientes"")
+
+    gerentes_df = spark.table(""schema.tb_clientes"")
+
+
+
+    # Verificação inicial dos dados
+
+    logger.info(f"Total de clientes carregados: {clientes_df.count()}")
+
+
+
+    clientes_df.show(10, truncate=False)
+
+    gerentes_df.show(10, truncate=False)
+
+
+
+    logger.info(f"Total de gerentes carregados: {gerentes_df.count()}")
+
+
+
+    # Ajustar filtro para incluir apenas registros válidos
+
+    clientes_df = clientes_df.filter(F.col("localpara").isNotNull())
+
+    gerentes_df = gerentes_df.filter(F.col("localpara").isNotNull())
+
+
+
+    # Verificação após filtro
+
+    logger.info(f"Total de clientes após filtro: {clientes_df.count()}")
+
+    logger.info(f"Total de gerentes após filtro: {gerentes_df.count()}")
+
+
+
+    return clientes_df, gerentes_df
+
+
+
+def distribuir_clientes(clientes_df: DataFrame, gerentes_df: DataFrame, config: ConfigDistribuicao, logger: logging.Logger) -> DataFrame:
+
+    """Realiza a distribuição de clientes para gerentes"""
+
+    logger.info("Iniciando processo de distribuição...")
+
+    
+
+    # Faz a combinação entre clientes e gerentes com a mesma chave `localpara`
+
+    combinacao = clientes_df.join(gerentes_df, "localpara")
+
+    
+
+    # Define uma janela para balancear a distribuição entre os gerentes dentro de cada `localpara`
+
+    window_dist = Window.partitionBy("nr_pess").orderBy(F.rand())
+
+    
+
+    # Atribui um índice de linha para cada combinação de cliente e gerente
+
+    distribuicao = combinacao.withColumn(
+
+        "row_number",
+
+        F.row_number().over(window_dist)
+
+    ).filter(F.col("row_number") == 1).drop("row_number")
+
+
+
+    # Verifica se todos os clientes foram distribuídos
+
+    clientes_distribuidos = distribuicao.select("nr_pess").distinct().count()
+
+    total_clientes = clientes_df.select("nr_pess").distinct().count()
+
+
+
+    if clientes_distribuidos != total_clientes:
+
+        raise Exception("Erro: Nem todos os clientes foram distribuídos!")
+
+
+
+    logger.info(f"Distribuição concluída: {distribuicao.count()} clientes atribuídos.")
+
+    return distribuicao
+
+
+
+def validar_distribuicao(df: DataFrame, logger: logging.Logger) -> None:
+
+    """Valida a distribuição realizada"""
+
+    logger.info("Validando a distribuição...")
+
+    duplicados = df.groupBy("nr_pess").agg(F.count("*").alias("qtd")).filter(F.col("qtd") > 1)
+
+    duplicados_count = duplicados.count()
+
+ 
+
+    if duplicados_count > 0:
+
+        logger.error(f"Encontrados {duplicados_count} CPFs duplicados na distribuição.")
+
+        raise Exception("Erro: Clientes atribuídos a mais de um gerente!")
+
+ 
+
+    logger.info("Validação concluída: cada cliente foi atribuído a um único gerente.")
+
+
+
+def salvar_resultado(df: DataFrame, logger: logging.Logger) -> None:
+
+    """Salva os resultados da distribuição"""
+
+    logger.info("Salvando os resultados da distribuição...")
+
+    df.write.saveAsTable("schema.tb_clientes"', mode='overwrite', overwriteSchema='true', mergeSchema='true')
+
+    logger.info("Resultados salvos com sucesso.")
+
+
+
+def main():
+
+    config = ConfigDistribuicao()
+
+    spark = get_spark_session(config)
+
+    logger = setup_logging()
+
+ 
+
+    logger.info("=== Início do processo de distribuição ===")
+
+    try:
+
+        # Carregamento dos dados
+
+        clientes_df, gerentes_df = load_data(spark, logger)
+
+ 
+
+        # Distribuição de clientes
+
+        resultado_df = distribuir_clientes(clientes_df, gerentes_df, config, logger)
+
+ 
+
+        # Validação dos resultados
+
+        validar_distribuicao(resultado_df, logger)
+
+ 
+
+        # Salvamento dos resultados
+
+        salvar_resultado(resultado_df, logger)
+
+ 
+
+        logger.info("=== Processo concluído com sucesso ===")
+
+ 
+
+    except Exception as e:
+
+        logger.error(f"Erro crítico: {str(e)}")
+
+        raise
+
+
+
+if __name__ == "__main__":
+
+    main()
+
